@@ -37,6 +37,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::hash::Hash;
 use std::io;
+use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -469,6 +470,10 @@ where
 
         let key = {
             hash_key(
+                absolute_input_path
+                    .as_path()
+                    .to_str()
+                    .expect("converting input path to str"),
                 &executable_digest,
                 parsed_args.language,
                 &common_and_arch_args,
@@ -1291,6 +1296,7 @@ static CACHED_ENV_VARS: Lazy<HashSet<&'static OsStr>> = Lazy::new(|| {
 
 /// Compute the hash key of `compiler` compiling `preprocessor_output` with `args`.
 pub fn hash_key(
+    path: &str,
     compiler_digest: &str,
     language: Language,
     arguments: &[OsString],
@@ -1299,6 +1305,23 @@ pub fn hash_key(
     preprocessor_output: &[u8],
     plusplus: bool,
 ) -> String {
+    // open temporary file for writing.
+    let mut temp_file = tempfile::Builder::new()
+        .prefix::<String>(&format!("sccache-{}-", path.replace("/", "__")).into())
+        .suffix(".tmp")
+        .tempfile()
+        .expect("create temporary file");
+
+    let separator = "----------------------------------------";
+    write!(
+        temp_file,
+        "compiler_digest:\n{compiler_digest:?}\n{separator}
+        language:\n{language:?}\n{separator}
+        arguments:\n{arguments:?}\n{separator}
+        extra_hashes:\n{extra_hashes:?}\n{separator}\n"
+    )
+    .expect("writing fields");
+
     // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
     let mut m = Digest::new();
     m.update(compiler_digest.as_bytes());
@@ -1314,14 +1337,33 @@ pub fn hash_key(
         m.update(hash.as_bytes());
     }
 
+    write!(temp_file, "env_vars:\n").expect("writing fields");
     for (var, val) in env_vars.iter() {
         if CACHED_ENV_VARS.contains(var.as_os_str()) {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(&b"="[..]);
             val.hash(&mut HashToDigest { digest: &mut m });
+            write!(
+                temp_file,
+                "{var}={val}\n",
+                var = var.to_string_lossy(),
+                val = val.to_string_lossy()
+            )
+            .expect("writing fields");
         }
     }
+    writeln!(temp_file, "{separator}").expect("writing fields");
+
+    writeln!(temp_file, "preprocessor_output:").expect("writing fields");
+    writeln!(
+        temp_file,
+        "{}",
+        String::from_utf8_lossy(preprocessor_output)
+    )
+    .expect("writing fields");
+
     m.update(preprocessor_output);
+    temp_file.keep().expect("saving temp file");
     m.finish()
 }
 
