@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
-use crate::cache::{storage_from_config, Storage};
+use crate::cache::readonly::ReadOnlyStorage;
+use crate::cache::{storage_from_config, CacheMode, Storage};
 use crate::compiler::{
     get_compiler_info, CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher,
     CompilerKind, CompilerProxy, DistType, Language, MissType,
@@ -433,7 +434,7 @@ pub fn start_server(config: &Config, port: u16) -> Result<()> {
 
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
 
-    let storage = match storage_from_config(config, &pool) {
+    let raw_storage = match storage_from_config(config, &pool) {
         Ok(storage) => storage,
         Err(err) => {
             error!("storage init failed for: {err:?}");
@@ -450,7 +451,7 @@ pub fn start_server(config: &Config, port: u16) -> Result<()> {
     };
 
     let cache_mode = runtime.block_on(async {
-        match storage.check().await {
+        match raw_storage.check().await {
             Ok(mode) => Ok(mode),
             Err(err) => {
                 error!("storage check failed for: {err:?}");
@@ -467,6 +468,11 @@ pub fn start_server(config: &Config, port: u16) -> Result<()> {
         }
     })?;
     info!("server has setup with {cache_mode:?}");
+
+    let storage = match cache_mode {
+        CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(raw_storage)),
+        _ => raw_storage,
+    };
 
     let res =
         SccacheServer::<ProcessCommandCreator>::new(port, runtime, client, dist_client, storage);
@@ -812,10 +818,7 @@ where
                 Request::ZeroStats => {
                     debug!("handle_client: zero_stats");
                     me.zero_stats().await;
-                    me.get_info()
-                        .await
-                        .map(|i| Response::Stats(Box::new(i)))
-                        .map(Message::WithoutBody)
+                    Ok(Message::WithoutBody(Response::ZeroStats))
                 }
                 Request::Shutdown => {
                     debug!("handle_client: shutdown");
@@ -920,22 +923,7 @@ where
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
         let stats = self.stats.lock().await.clone();
-        let cache_location = self.storage.location();
-        let use_preprocessor_cache_mode = self
-            .storage
-            .preprocessor_cache_mode_config()
-            .use_preprocessor_cache_mode;
-        let version = env!("CARGO_PKG_VERSION").to_string();
-        futures::try_join!(self.storage.current_size(), self.storage.max_size()).map(
-            move |(cache_size, max_cache_size)| ServerInfo {
-                stats,
-                cache_location,
-                cache_size,
-                max_cache_size,
-                use_preprocessor_cache_mode,
-                version,
-            },
-        )
+        ServerInfo::new(stats, Some(&*self.storage)).await
     }
 
     /// Zero stats about the cache.
@@ -1688,6 +1676,35 @@ impl ServerStats {
 }
 
 impl ServerInfo {
+    pub async fn new(stats: ServerStats, storage: Option<&dyn Storage>) -> Result<Self> {
+        let cache_location;
+        let use_preprocessor_cache_mode;
+        let cache_size;
+        let max_cache_size;
+        if let Some(storage) = storage {
+            cache_location = storage.location();
+            use_preprocessor_cache_mode = storage
+                .preprocessor_cache_mode_config()
+                .use_preprocessor_cache_mode;
+            (cache_size, max_cache_size) =
+                futures::try_join!(storage.current_size(), storage.max_size())?;
+        } else {
+            cache_location = String::new();
+            use_preprocessor_cache_mode = false;
+            cache_size = None;
+            max_cache_size = None;
+        }
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        Ok(ServerInfo {
+            stats,
+            cache_location,
+            cache_size,
+            max_cache_size,
+            use_preprocessor_cache_mode,
+            version,
+        })
+    }
+
     /// Print info to stdout in a human-readable format.
     pub fn print(&self, advanced: bool) {
         let (name_width, stat_width) = self.stats.print(advanced);

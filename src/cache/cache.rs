@@ -16,11 +16,13 @@
 use crate::cache::azure::AzureBlobCache;
 use crate::cache::disk::DiskCache;
 #[cfg(feature = "gcs")]
-use crate::cache::gcs::{GCSCache, RWMode};
+use crate::cache::gcs::GCSCache;
 #[cfg(feature = "gha")]
 use crate::cache::gha::GHACache;
 #[cfg(feature = "memcached")]
 use crate::cache::memcached::MemcachedCache;
+#[cfg(feature = "oss")]
+use crate::cache::oss::OSSCache;
 #[cfg(feature = "redis")]
 use crate::cache::redis::RedisCache;
 #[cfg(feature = "s3")]
@@ -36,7 +38,8 @@ use crate::config::Config;
     feature = "memcached",
     feature = "redis",
     feature = "s3",
-    feature = "webdav"
+    feature = "webdav",
+    feature = "oss"
 ))]
 use crate::config::{self, CacheType};
 use async_trait::async_trait;
@@ -112,8 +115,8 @@ impl fmt::Debug for Cache {
     }
 }
 
-/// CacheMode is used to repreent which mode we are using.
-#[derive(Debug)]
+/// CacheMode is used to represent which mode we are using.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CacheMode {
     /// Only read cache from storage.
     ReadOnly,
@@ -442,7 +445,15 @@ impl PreprocessorCacheModeConfig {
 }
 
 /// Implement storage for operator.
-#[cfg(any(feature = "s3", feature = "azure", feature = "gcs", feature = "redis"))]
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3",
+    feature = "webdav",
+))]
 #[async_trait]
 impl Storage for opendal::Operator {
     async fn get(&self, key: &str) -> Result<Cache> {
@@ -567,17 +578,12 @@ pub fn storage_from_config(
             }) => {
                 debug!("Init gcs cache with bucket {bucket}, key_prefix {key_prefix}");
 
-                let gcs_read_write_mode = match rw_mode {
-                    config::GCSCacheRWMode::ReadOnly => RWMode::ReadOnly,
-                    config::GCSCacheRWMode::ReadWrite => RWMode::ReadWrite,
-                };
-
                 let storage = GCSCache::build(
                     bucket,
                     key_prefix,
                     cred_path.as_deref(),
                     service_account.as_deref(),
-                    gcs_read_write_mode,
+                    (*rw_mode).into(),
                     credential_url.as_deref(),
                 )
                 .map_err(|err| anyhow!("create gcs cache failed: {err:?}"))?;
@@ -596,18 +602,59 @@ pub fn storage_from_config(
             CacheType::Memcached(config::MemcachedCacheConfig {
                 ref url,
                 ref expiration,
+                ref key_prefix,
             }) => {
                 debug!("Init memcached cache with url {url}");
 
-                let storage = MemcachedCache::build(url, *expiration)
+                let storage = MemcachedCache::build(url, key_prefix, *expiration)
                     .map_err(|err| anyhow!("create memcached cache failed: {err:?}"))?;
                 return Ok(Arc::new(storage));
             }
             #[cfg(feature = "redis")]
-            CacheType::Redis(config::RedisCacheConfig { ref url }) => {
-                debug!("Init redis cache with url {url}");
-                let storage = RedisCache::build(url)
-                    .map_err(|err| anyhow!("create redis cache failed: {err:?}"))?;
+            CacheType::Redis(config::RedisCacheConfig {
+                ref endpoint,
+                ref cluster_endpoints,
+                ref username,
+                ref password,
+                ref db,
+                ref url,
+                ref ttl,
+                ref key_prefix,
+            }) => {
+                let storage = match (endpoint, cluster_endpoints, url) {
+                    (Some(url), None, None) => {
+                        debug!("Init redis single-node cache with url {url}");
+                        RedisCache::build_single(
+                            url,
+                            username.as_deref(),
+                            password.as_deref(),
+                            *db,
+                            key_prefix,
+                            *ttl,
+                        )
+                    }
+                    (None, Some(urls), None) => {
+                        debug!("Init redis cluster cache with urls {urls}");
+                        RedisCache::build_cluster(
+                            urls,
+                            username.as_deref(),
+                            password.as_deref(),
+                            *db,
+                            key_prefix,
+                            *ttl,
+                        )
+                    }
+                    (None, None, Some(url)) => {
+                        warn!("Init redis single-node cache from deprecated API with url {url}");
+                        if username.is_some() || password.is_some() || *db != crate::config::DEFAULT_REDIS_DB {
+                            bail!("`username`, `password` and `db` has no effect when `url` is set. Please use `endpoint` or `cluster_endpoints` for new API accessing");
+                        }
+
+                        RedisCache::build_from_url(url, key_prefix, *ttl)
+                    }
+                    _ => bail!("Only one of `endpoint`, `cluster_endpoints`, `url` must be set"),
+                }
+                .map_err(|err| anyhow!("create redis cache failed: {err:?}"))?;
                 return Ok(Arc::new(storage));
             }
             #[cfg(feature = "s3")]
@@ -645,25 +692,47 @@ pub fn storage_from_config(
 
                 return Ok(Arc::new(storage));
             }
+            #[cfg(feature = "oss")]
+            CacheType::OSS(ref c) => {
+                debug!(
+                    "Init oss cache with bucket {}, endpoint {:?}",
+                    c.bucket, c.endpoint
+                );
+
+                let storage = OSSCache::build(
+                    &c.bucket,
+                    &c.key_prefix,
+                    c.endpoint.as_deref(),
+                    c.no_credentials,
+                )
+                .map_err(|err| anyhow!("create oss cache failed: {err:?}"))?;
+
+                return Ok(Arc::new(storage));
+            }
             #[allow(unreachable_patterns)]
-            _ => bail!("cache type is not enabled"),
+            // if we build only with `cargo build --no-default-features`
+            // we only want to use sccache with a local cache (no remote storage)
+            _ => {}
         }
     }
 
     let (dir, size) = (&config.fallback_cache.dir, config.fallback_cache.size);
     let preprocessor_cache_mode_config = config.fallback_cache.preprocessor_cache_mode;
+    let rw_mode = config.fallback_cache.rw_mode.into();
     debug!("Init disk cache with dir {:?}, size {}", dir, size);
     Ok(Arc::new(DiskCache::new(
         dir,
         size,
         pool,
         preprocessor_cache_mode_config,
+        rw_mode,
     )))
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::config::CacheModeConfig;
 
     #[test]
     fn test_normalize_key() {
@@ -671,5 +740,69 @@ mod test {
             normalize_key("0123456789abcdef0123456789abcdef"),
             "0/1/2/0123456789abcdef0123456789abcdef"
         );
+    }
+
+    #[test]
+    fn test_read_write_mode_local() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+
+        // Use disk cache.
+        let mut config = Config {
+            cache: None,
+            ..Default::default()
+        };
+
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_test_rust_cargo")
+            .tempdir()
+            .context("Failed to create tempdir")
+            .unwrap();
+        let cache_dir = tempdir.path().join("cache");
+        fs::create_dir(&cache_dir).unwrap();
+
+        config.fallback_cache.dir = cache_dir;
+
+        // Test Read Write
+        config.fallback_cache.rw_mode = CacheModeConfig::ReadWrite;
+
+        {
+            let cache = storage_from_config(&config, runtime.handle()).unwrap();
+
+            runtime.block_on(async move {
+                cache.put("test1", CacheWrite::default()).await.unwrap();
+                cache
+                    .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
+                    .unwrap();
+            });
+        }
+
+        // Test Read-only
+        config.fallback_cache.rw_mode = CacheModeConfig::ReadOnly;
+
+        {
+            let cache = storage_from_config(&config, runtime.handle()).unwrap();
+
+            runtime.block_on(async move {
+                assert_eq!(
+                    cache
+                        .put("test1", CacheWrite::default())
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    "Cannot write to a read-only cache"
+                );
+                assert_eq!(
+                    cache
+                        .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
+                        .unwrap_err()
+                        .to_string(),
+                    "Cannot write to a read-only cache"
+                );
+            });
+        }
     }
 }

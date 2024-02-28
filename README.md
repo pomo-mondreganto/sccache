@@ -42,6 +42,7 @@ Table of Contents (ToC)
   * [Azure](docs/Azure.md)
   * [GitHub Actions](docs/GHA.md)
   * [WebDAV (Ccache/Bazel/Gradle compatible)](docs/Webdav.md)
+  * [Alibaba OSS](docs/OSS.md)
 
 ---
 
@@ -128,7 +129,7 @@ To use sccache with cmake, provide the following command line arguments to cmake
 -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 ```
 
-To generate PDB files for debugging with MSVC, you can use the [`/Z7` option](https://docs.microsoft.com/en-us/cpp/build/reference/z7-zi-zi-debug-information-format?view=msvc-160). Alternatively, the `/Zi` option together with `/Fd` can work if `/Fd` names a different PDB file name for each object file created. Note that CMake sets `/Zi` by default, so if you use CMake, you can use `/Z7` by adding code like this in your CMakeLists.txt:
+The process for using sccache with MSVC and cmake, depends on which version of cmake you're using. **For versions of cmake 3.24 and earlier**, to generate PDB files for debugging with MSVC, you can use the [`/Z7` option](https://docs.microsoft.com/en-us/cpp/build/reference/z7-zi-zi-debug-information-format?view=msvc-160). Alternatively, the `/Zi` option together with `/Fd` can work if `/Fd` names a different PDB file name for each object file created. Note that CMake sets `/Zi` by default, so if you use CMake, you can use `/Z7` by adding code like this in your CMakeLists.txt:
 
 ```cmake
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -145,9 +146,10 @@ endif()
 
 By default, sccache will fail your build if it fails to successfully communicate with its associated server. To have sccache instead gracefully failover to the local compiler without stopping, set the environment variable `SCCACHE_IGNORE_SERVER_IO_ERROR=1`.
 
-Update: On CMake 3.25, you have to use the new `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT` option, meant to configure the `-Z7` flag:
+**For versions of cmake 3.25 and later**, to compile with MSVC, you have to use the new `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT` option, meant to configure the `-Z7` flag.  Additionally, you must set the cmake policy number 0141 to the NEW setting:
 ```cmake
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+cmake_policy(SET CMP0141 NEW)
 ```
 
 Example configuration where we automatically look for `sccache` in the `PATH`:
@@ -157,9 +159,16 @@ find_program(SCCACHE sccache REQUIRED)
 set(CMAKE_C_COMPILER_LAUNCHER ${SCCACHE})
 set(CMAKE_CXX_COMPILER_LAUNCHER ${SCCACHE})
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+cmake_policy(SET CMP0141 NEW)
 ```
 
-And you can build code as usual without any additional flags in the command line, useful for IDEs.
+Alternatively, if configuring cmake with MSVC on the command line, assuming that sccache is on the default search path:
+
+```
+cmake -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded -DCMAKE_POLICY_CMP0141=NEW [...]
+```
+
+And you can build code as usual without any additional flags in the command line, which is useful for IDEs.
 
 To limit the number of threads sccache process spawns, use `SCCACHE_SERVER_WORKER_THREADS` and `SCCACHE_CLIENT_WORKER_THREADS` environment variables for server and client processes respectively.
 
@@ -168,7 +177,7 @@ To limit the number of threads sccache process spawns, use `SCCACHE_SERVER_WORKE
 Build Requirements
 ------------------
 
-sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus`rustc`). sccache currently requires **Rust 1.67.1**. We recommend you install Rust via [Rustup](https://rustup.rs/).
+sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus`rustc`). sccache currently requires **Rust 1.70.0**. We recommend you install Rust via [Rustup](https://rustup.rs/).
 
 Build
 -----
@@ -176,8 +185,10 @@ Build
 If you are building sccache for non-development purposes make sure you use `cargo build --release` to get optimized binaries:
 
 ```bash
-cargo build --release [--no-default-features --features=s3|redis|gcs|memcached|azure]
+cargo build --release [--no-default-features --features=s3|redis|gcs|memcached|azure|gha|webdav|oss]
 ```
+
+List of actual list of available features can be found in the `Cargo.toml` file, `[features]` section.
 
 By default, `sccache` builds with support for all storage backends, but individual backends may be disabled by resetting the list of features and enabling all the other backends. Refer the [Cargo Documentation](http://doc.crates.io/manifest.html#the-features-section) for details on how to select features with Cargo.
 
@@ -288,3 +299,4 @@ Storage Options
 * [Azure](docs/Azure.md)
 * [GitHub Actions](docs/GHA.md)
 * [WebDAV (Ccache/Bazel/Gradle compatible)](docs/Webdav.md)
+* [Alibaba OSS](docs/OSS.md)

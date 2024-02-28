@@ -26,7 +26,7 @@ jobs:
         with:
           components: ${{ matrix.component }}
           # Oldest supported version, keep in sync with README.md
-          toolchain: "1.67.1"
+          toolchain: "1.70.0"
 
       - name: clippy version
         run: cargo clippy --version
@@ -34,6 +34,18 @@ jobs:
 
       - name: Check
         run: cargo ${{ matrix.cargo_cmd }}
+
+  check_features:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature: [azure, gcs, gha, memcached, redis, s3, webdav]
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Check feature ${{ matrix.feature }}
+        run: cargo check --no-default-features --features ${{ matrix.feature }}
 
   toml_format:
     runs-on: ubuntu-latest
@@ -55,10 +67,10 @@ jobs:
         include:
           - os: ubuntu-20.04
             # Oldest supported version, keep in sync with README.md
-            rustc: "1.67.1"
+            rustc: "1.70.0"
           - os: ubuntu-22.04
             # Oldest supported version, keep in sync with README.md
-            rustc: "1.67.1"
+            rustc: "1.70.0"
             extra_desc: dist-server
             extra_args: --no-default-features --features=dist-tests test_dist_ -- --test-threads 1
           - os: ubuntu-20.04
@@ -69,11 +81,17 @@ jobs:
             rustc: nightly
             allow_failure: true
             extra_args: --features=unstable
+          - os: ubuntu-20.04
+            extra_desc: no-default-features
+            extra_args: --no-default-features
+            allow_failure: true
           - os: ubuntu-22.04
           - os: macOS-11
+          # M1 CPU
+          - os: macos-14
           - os: windows-2019
             # Oldest supported version, keep in sync with README.md
-            rustc: "1.67.1"
+            rustc: "1.70.0"
           - os: windows-2019
             rustc: nightly
             allow_failure: true
@@ -110,6 +128,7 @@ jobs:
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    container: ${{ fromJson(matrix.container || '{"image":null}') }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -123,16 +142,20 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-20.04
             target: aarch64-unknown-linux-musl
+          - os: ubuntu-20.04
+            target: armv7-unknown-linux-musleabi
+            container: '{"image": "messense/rust-musl-cross:armv7-musleabi"}'
+          - os: ubuntu-20.04
+            target: i686-unknown-linux-musl
+            container: '{"image": "messense/rust-musl-cross:i686-musl"}'
           - os: macOS-11
             target: x86_64-apple-darwin
             macosx_deployment_target: 10.13
             developer_dir: /Applications/Xcode_11.7.app
             sdkroot: /Applications/Xcode_11.7.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.15.sdk
-          - os: macOS-11
+          - os: macos-14
             target: aarch64-apple-darwin
             macosx_deployment_target: 11.0
-            developer_dir: /Applications/Xcode_13.2.1.app
-            sdkroot: /Applications/Xcode_13.2.1.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX12.1.sdk
           - os: windows-2019
             target: x86_64-pc-windows-msvc
             rustflags: -Ctarget-feature=+crt-static
@@ -145,6 +168,7 @@ jobs:
         with:
           toolchain: ${{ matrix.target == 'aarch64-apple-darwin' && 'beta' || 'stable' }}
           target: ${{ matrix.target }}
+        if: ${{ !matrix.container }}
 
       - name: Install musl-tools (x86_64)
         run: sudo apt-get install musl-tools
@@ -181,7 +205,7 @@ jobs:
           ID: ${{ startsWith(github.ref, 'refs/tags/') && github.ref || github.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.binary || 'sccache' }}-${{ steps.id.outputs.id }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary || 'sccache' }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
@@ -248,7 +272,7 @@ jobs:
           echo "report=${COVERAGE_REPORT_FILE}" >> $GITHUB_OUTPUT
 
       - name: Upload coverage results (to Codecov.io)
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
         with:
           file: ${{ steps.coverage.outputs.report }}
           ## flags: IntegrationTests, UnitTests, ${{ steps.vars.outputs.CODECOV_FLAGS }}
@@ -264,15 +288,15 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { os: macos-12 }
-        release: ["13.2"]
+          - { os: ubuntu-22.04 }
     steps:
       - uses: actions/checkout@v4
       - name: Prepare, build and test
-        uses: vmactions/freebsd-vm@v0
+        uses: vmactions/freebsd-vm@v1.0.6
         with:
           mem: 8192
           usesh: true
+          sync: rsync
           copyback: false
           prepare: pkg install -y ca_root_nss curl gmake gtar pot sudo
           run: |
@@ -289,7 +313,7 @@ jobs:
             TEST_USER=tester
             TEST_USER_HOME="/opt/$TEST_USER"
             REPO_NAME=${GITHUB_WORKSPACE##*/}
-            WORKSPACE_PARENT="/Users/runner/work/${REPO_NAME}"
+            WORKSPACE_PARENT="/home/runner/work/${REPO_NAME}"
             WORKSPACE="${WORKSPACE_PARENT}/${REPO_NAME}"
             export WORKSPACE
             #
@@ -338,7 +362,7 @@ jobs:
           fi
 
       - name: Get artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
 
       - name: Create release assets
         run: |
