@@ -1,6 +1,3 @@
-// Copyright 2016 Mozilla Foundation
-// Copyright 2017 David Michael Barr <b@rr-dav.id.au>
-//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,23 +10,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
-
 use opendal::layers::LoggingLayer;
-use opendal::services::Memcached;
+use opendal::services::Oss;
 use opendal::Operator;
 
 use crate::errors::*;
 
-#[derive(Clone)]
-pub struct MemcachedCache;
+pub struct OSSCache;
 
-impl MemcachedCache {
-    pub fn build(url: &str, key_prefix: &str, expiration: u32) -> Result<Operator> {
-        let mut builder = Memcached::default();
-        builder.endpoint(url);
+// Implement the Object Storage Service for Alibaba cloud
+impl OSSCache {
+    pub fn build(
+        bucket: &str,
+        key_prefix: &str,
+        endpoint: Option<&str>,
+        no_credentials: bool,
+    ) -> Result<Operator> {
+        let mut builder = Oss::default();
+        builder.bucket(bucket);
         builder.root(key_prefix);
-        builder.default_ttl(Duration::from_secs(expiration.into()));
+
+        if let Some(endpoint) = endpoint {
+            builder.endpoint(endpoint);
+        }
+
+        if no_credentials {
+            // Allow anonymous access to OSS so that OpenDAL will not
+            // throw error when no credentials are provided.
+            builder.allow_anonymous();
+        }
 
         let op = Operator::new(builder)?
             .layer(LoggingLayer::default())

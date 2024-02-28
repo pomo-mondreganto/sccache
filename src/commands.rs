@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cache::storage_from_config;
 use crate::client::{connect_to_server, connect_with_retry, ServerConnection};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
@@ -19,7 +20,7 @@ use crate::config::{default_disk_cache_dir, Config};
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
-use crate::server::{self, DistInfo, ServerInfo, ServerStartup};
+use crate::server::{self, DistInfo, ServerInfo, ServerStartup, ServerStats};
 use crate::util::daemonize;
 use byteorder::{BigEndian, ByteOrder};
 use fs::{File, OpenOptions};
@@ -89,6 +90,15 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     let runtime = Runtime::new()?;
     let exe_path = env::current_exe()?;
     let workdir = exe_path.parent().expect("executable path has no parent?!");
+
+    // Spawn a blocking task to bind the Unix socket. Note that the socket
+    // must be bound before spawning `_child` below to avoid a race between
+    // the parent binding the socket and the child connecting to it.
+    let listener = {
+        let _guard = runtime.enter();
+        tokio::net::UnixListener::bind(&socket_path)?
+    };
+
     let _child = process::Command::new(&exe_path)
         .current_dir(workdir)
         .env("SCCACHE_START_SERVER", "1")
@@ -97,7 +107,6 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
         .spawn()?;
 
     let startup = async move {
-        let listener = tokio::net::UnixListener::bind(&socket_path)?;
         let (socket, _) = listener.accept().await?;
 
         read_server_startup_status(socket).await
@@ -326,13 +335,13 @@ fn connect_or_start_server(
 }
 
 /// Send a `ZeroStats` request to the server, and return the `ServerInfo` request if successful.
-pub fn request_zero_stats(mut conn: ServerConnection) -> Result<ServerInfo> {
+pub fn request_zero_stats(mut conn: ServerConnection) -> Result<()> {
     debug!("request_stats");
     let response = conn.request(Request::ZeroStats).context(
         "failed to send zero statistics command to server or failed to receive response",
     )?;
-    if let Response::Stats(stats) = response {
-        Ok(*stats)
+    if let Response::ZeroStats = response {
+        Ok(())
     } else {
         bail!("Unexpected server response!")
     }
@@ -608,8 +617,16 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::ShowStats(fmt, advanced) => {
             trace!("Command::ShowStats({:?})", fmt);
-            let srv = connect_or_start_server(get_port(), startup_timeout)?;
-            let stats = request_stats(srv).context("failed to get stats from server")?;
+            let stats = match connect_to_server(get_port()) {
+                Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
+                // If there is no server, spawning a new server would start with zero stats
+                // anyways, so we can just return (mostly) empty stats directly.
+                Err(_) => {
+                    let runtime = Runtime::new()?;
+                    let storage = storage_from_config(config, runtime.handle()).ok();
+                    runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
+                }
+            };
             match fmt {
                 StatsFormat::Text => stats.print(advanced),
                 StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
@@ -672,8 +689,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
             let conn = connect_or_start_server(get_port(), startup_timeout)?;
-            let stats = request_zero_stats(conn).context("couldn't zero stats on server")?;
-            stats.print(false);
+            request_zero_stats(conn).context("couldn't zero stats on server")?;
+            eprintln!("Statistics zeroed.");
         }
         #[cfg(feature = "dist-client")]
         Command::DistAuth => {
