@@ -471,7 +471,6 @@ where
         let key = {
             hash_key(
                 absolute_input_path
-                    .as_path()
                     .to_str()
                     .expect("converting input path to str"),
                 &executable_digest,
